@@ -5,9 +5,11 @@ from pathlib import Path
 from typing import Optional 
 
 from src.data_class import Context
+
 from src.utils.pytorch import setup_torch
 from src.utils.formatting import syntax_print
 
+from src.executable.preprocess import preprocess_data
 
 def get_context(config_path: Optional[str] = None) -> Context:
     '''
@@ -28,7 +30,7 @@ def preprocess(in_path: str = 'data.txt', out_path: str = "out.tensor"):
     '''
     Processing original data into `out.tensor`
     '''
-    # preprocess_data(in_path, out_path)
+    preprocess_data(in_path, out_path)
 
 
 @argh.arg('-c', '--config_path', default='configs/small.yaml', help='Path for the config file')
