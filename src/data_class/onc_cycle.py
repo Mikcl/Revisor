@@ -1,5 +1,5 @@
 from typing import Optional
-from . import DataClass
+from .dataclass import DataClass
 
 class OneCycle(DataClass):
     cycle_min_lr: float = 3e-4  # Base learning rate used at the start and end of cycle.
