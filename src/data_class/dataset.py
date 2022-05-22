@@ -1,4 +1,4 @@
-from dataclass import DataClass
+from .dataclass import DataClass
 
 class Dataset(DataClass):
     file_name: str = "out.tensor"

@@ -1,5 +1,5 @@
-from data_class import DataClass
-from data_class.onc_cycle import OneCycle
+from .dataclass import DataClass
+from .onc_cycle import OneCycle
 
 
 class Optimizer(DataClass):

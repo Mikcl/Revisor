@@ -1,6 +1,6 @@
 import torch
 
-from data_class.dataclass import DataClass
+from .dataclass import DataClass
 
 
 class Model(DataClass):

@@ -9,7 +9,7 @@ from src.data_class import Context
 from typing import Optional
 
 # from src.model import LinearAttention, Trainer
-from formatting import pretty_print
+from .formatting import pretty_print
 
 DataLoaderIter = torch.utils.data.dataloader._BaseDataLoaderIter
 
