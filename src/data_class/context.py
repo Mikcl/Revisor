@@ -5,7 +5,7 @@ from pathlib import Path
 from data_class import DataClass
 from data_class.model import Model
 from data_class.optimizer import Optimizer
-
+from data_class.dataset import Dataset
 
 def init_class(instance: DataClass, config: Dict[str, Any]):
     for name in dir(instance):
