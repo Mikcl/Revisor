@@ -1,0 +1,10 @@
+model:
+  depth: 32
+  batch_size: 1024
+optimizer:
+  one_cycle:
+    cycle_first_step_size: 8192
+    cycle_second_step_size: null
+    cycle_max_lr: 0.01
+dataset:
+  num_workers: 12
