@@ -5,10 +5,10 @@ import torch.utils.data.dataloader
 import math
 import random
 
-from src.data_class import Context
+from ..data_class.context import Context
 from typing import Optional
 
-# from src.model import LinearAttention, Trainer
+from ..model import LinearAttention, Trainer
 from .formatting import pretty_print
 
 DataLoaderIter = torch.utils.data.dataloader._BaseDataLoaderIter
@@ -40,21 +40,21 @@ def setup_torch(seed: int):
     torch.manual_seed(seed)
 
 
-# def get_model(ctx: Context, load_model: bool, data: Optional[torch.Tensor] = None) -> Trainer:
-#     mod = Trainer(ctx, LinearAttention(ctx).to(dtype=torch.float16 if ctx.model.float16 else torch.float),
-#                   data if data is None else None)
+def get_model(ctx: Context, load_model: bool, data: Optional[torch.Tensor] = None) -> Trainer:
+    mod = Trainer(ctx, LinearAttention(ctx).to(dtype=torch.float16 if ctx.model.float16 else torch.float),
+                  data if data is None else None)
 
-#     if ctx.model.print_on_init:
-#         pretty_print(str(mod))
+    if ctx.model.print_on_init:
+        pretty_print(str(mod))
 
-#     parameters = sum(np.prod(p.size()) for p in filter(lambda p: p.requires_grad, mod.parameters()))
-#     base = int(math.log10(parameters) / 3)
-#     pretty_print(f'Parameters: {parameters / (1000 ** base):.1f}{" kMBT"[base]}')
-#     if load_model:
-#         mod.load()
-#     if not ctx.model.offloading:
-#         mod = mod.to(ctx.model.device)
-#     return mod
+    parameters = sum(np.prod(p.size()) for p in filter(lambda p: p.requires_grad, mod.parameters()))
+    base = int(math.log10(parameters) / 3)
+    pretty_print(f'Parameters: {parameters / (1000 ** base):.1f}{" kMBT"[base]}')
+    if load_model:
+        mod.load()
+    if not ctx.model.offloading:
+        mod = mod.to(ctx.model.device)
+    return mod
 
 
 def encode(prompt: str) -> torch.Tensor:

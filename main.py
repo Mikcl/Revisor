@@ -4,12 +4,13 @@ import yaml
 from pathlib import Path
 from typing import Optional 
 
-from src.data_class import Context
+from src.data_class.context import Context
 
 from src.utils.pytorch import setup_torch
 from src.utils.formatting import syntax_print
 
 from src.executable.preprocess import preprocess_data
+from src.executable.train import train_model
 
 def get_context(config_path: Optional[str] = None) -> Context:
     '''
@@ -46,7 +47,7 @@ def train(config_path: Optional[str] = None, steps: int = 0, load_model: bool = 
     dump = yaml.dump(ctx.serialize(), indent=4)
     syntax_print(dump, "yaml", title="Config")
 
-    # train_model(ctx, steps, load_model)
+    train_model(ctx, steps, load_model)
 
 
 @argh.arg('-g', '--generated_tokens', default='20', help='Number of tokens to be generated after prompt')
