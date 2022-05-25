@@ -4,7 +4,7 @@ import typing
 import deepspeed.ops.adam
 import torch
 
-from src.dataclass import Context
+from ..data_class.context import Context
 # from src.optimizers import shampoo
 
 # OWN_OPTIMIZER = {'Shampoo': shampoo.Shampoo}
