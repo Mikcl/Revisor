@@ -195,11 +195,7 @@ class Trainer(torch.nn.Module):
         return inp.to(device=self.ctx.model.device, non_blocking=True).detach()
 
     def _forward_backward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
-        print(src)
-        print(len(src))
         x_batch = self._to_device_detach(src)
-        print(x_batch)
-        print(self.model)
         output = self.model(x_batch)
         loss = F.cross_entropy(output, self._to_device_detach(tgt))
         loss.backward()
@@ -259,9 +255,7 @@ class LinearAttention(torch.nn.Module):
         torch.nn.init.zeros_(self.output.weight.data)
 
     def forward(self, inp: torch.Tensor):
-        print("HERE FORWARD", inp)
         x = self.embedding(inp).transpose(1, 2)
-        # x = self.stem(x)
         return self.output(x)
 
     def reset_cache(self):
