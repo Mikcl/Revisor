@@ -198,6 +198,8 @@ class Trainer(torch.nn.Module):
         print(src)
         print(len(src))
         x_batch = self._to_device_detach(src)
+        print(x_batch)
+        print(self.model)
         output = self.model(x_batch)
         loss = F.cross_entropy(output, self._to_device_detach(tgt))
         loss.backward()
