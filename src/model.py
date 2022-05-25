@@ -261,7 +261,7 @@ class LinearAttention(torch.nn.Module):
     def forward(self, inp: torch.Tensor):
         print("HERE FORWARD", inp)
         x = self.embedding(inp).transpose(1, 2)
-        x = self.stem(x)
+        # x = self.stem(x)
         return self.output(x)
 
     def reset_cache(self):
