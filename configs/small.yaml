@@ -7,4 +7,4 @@ optimizer:
     cycle_second_step_size: null
     cycle_max_lr: 0.01
 dataset:
-  num_workers: 12
+  num_workers: 2

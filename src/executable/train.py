@@ -29,7 +29,7 @@ def train_model(ctx: Context, steps=None, load_model: bool = False):
             p['betas'] = p['betas'][0], mod.ctx.optimizer.beta2
         with torch.no_grad():
             if i % 5 == 0:
-                log(mean_loss, mean_max_loss,
+                print(mean_loss, mean_max_loss,
                     mod.optimizer.param_groups[0]['lr'], mod.optimizer.param_groups[0]['betas'])
                 mean_loss.zero_()
                 mean_max_loss.zero_()
