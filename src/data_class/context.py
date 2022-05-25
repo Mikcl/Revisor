@@ -17,6 +17,8 @@ def init_class(instance: DataClass, config: Dict[str, Any]):
             continue
         setattr(instance, name, config[name])
 
+class Eval(DataClass):
+    cache: bool = False
 
 class Context(DataClass):
     def __init__(self, config: Optional[Dict[str, Any]] = None,
@@ -24,6 +26,7 @@ class Context(DataClass):
         self.optimizer = Optimizer()
         self.dataset = Dataset()
         self.model = Model()
+        self.eval = Eval()
 
         if config_path is not None:
             config = yaml.safe_load(config_path.read_text())
