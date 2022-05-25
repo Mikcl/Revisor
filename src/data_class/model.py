@@ -30,3 +30,6 @@ class Model(DataClass):
     experts_in_output: int = 0
     moe_jitter_epsilon: float = 0.02
     expert_chunks: int = 1  # Increase it if not all MoE parameters fit onto the GPU
+    activation_std: float = 0.5893595616022745  # std(relu(torch.randn((inf,)))) == 0.5893595616022745
+    input_embedding_std: float = 1.
+    position_embedding_std: float = 1.
