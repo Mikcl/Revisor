@@ -13,9 +13,9 @@ def train_model(ctx: Context, steps=None, load_model: bool = False):
     mod = get_model(ctx, load_model, next(data)[0])
 
     mean_loss = torch.zeros([], device=ctx.model.device, dtype=torch.float16 if ctx.model.float16 else torch.float)
-    mean_max_loss = mean_loss.clone()
 
     i = 0
+    PRINT_EVERY = 32
     while True:
         i += 1
 
@@ -28,11 +28,10 @@ def train_model(ctx: Context, steps=None, load_model: bool = False):
         for p in mod.optimizer.param_groups:  # OneCycle resets beta2 to 0.990
             p['betas'] = p['betas'][0], mod.ctx.optimizer.beta2
         with torch.no_grad():
-            if i % 5 == 0:
-                print(mean_loss, mean_max_loss,
+            if i % PRINT_EVERY == 0:
+                print(mean_loss.item() / PRINT_EVERY,
                     mod.optimizer.param_groups[0]['lr'], mod.optimizer.param_groups[0]['betas'])
                 mean_loss.zero_()
-                mean_max_loss.zero_()
             if None:
                 # TODO save model for larger training with checkpoints
                 mod.save()
