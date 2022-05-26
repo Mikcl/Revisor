@@ -15,7 +15,7 @@ def train_model(ctx: Context, steps=None, load_model: bool = False):
     mean_loss = torch.zeros([], device=ctx.model.device, dtype=torch.float16 if ctx.model.float16 else torch.float)
 
     i = 0
-    PRINT_EVERY = 32
+    PRINT_EVERY = 1
     while True:
         i += 1
 
