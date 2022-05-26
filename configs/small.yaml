@@ -1,5 +1,5 @@
 model:
-  depth: 32
+  depth: 256
   batch_size: 1024
 optimizer:
   one_cycle:
