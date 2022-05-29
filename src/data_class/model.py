@@ -22,9 +22,9 @@ class Model(DataClass):
     depth:int = 1
     max_seq_len: int = 64
     heads:int = 4
-    dim_head:int = 64
+    dim_head:int = 32
     causal:bool = False
-    emb_dim:int = 32 # also embedding dimension
+    emb_dim:int = 16 # also embedding dimension
     reversible:bool = False
     ff_chunks:int = 1
     ff_glu:bool = False
