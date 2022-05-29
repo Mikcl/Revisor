@@ -10,9 +10,9 @@ class Model(DataClass):
     print_on_init: bool = True
     features: int = 256
     momentumnet_beta: float = 0.99  # The higher this is, the more numerically stable. BUT also lower impact per layer
-    depth: int = 64
-    batch_size: int = 128
-    sequence_length: int = 256
+    depth: int = 16
+    batch_size: int = 64
+    sequence_length: int = 64
     float16: bool = False
     device: str = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     offloading: bool = False
