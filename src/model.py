@@ -1,350 +1,505 @@
-import copy
-import typing
-
-import numpy as np
-import revlib
 import torch
 import torch.utils.data
-from deepspeed.runtime import lr_schedules
 from torch.nn import functional as F
 
+from torch import nn, einsum
+import math
+from operator import mul
+from math import gcd
+from collections import namedtuple
+from functools import partial, reduce
+
+from local_attention import LocalAttention
+from linformer import LinformerSelfAttention
+
+from product_key_memory import PKM
+from axial_positional_embedding import AxialPositionalEmbedding
+from .linear_attention_transformer.reversible import ReversibleSequence, SequentialSequence
+
+from einops import rearrange, repeat
+
 from .data_class.context import Context
-from .optimizers.build import build_optimizer
 
-QUAD_TENSOR = typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+# ---------- HELPERS -----------
 
+# namedtuple settings
 
-def orthonormal(inp: typing.Union[torch.Tensor, torch.nn.Parameter, typing.List[int]], gain: float):
-    original_input = inp
-    if isinstance(inp, list):
-        inp = torch.zeros(inp)
-    if isinstance(inp, torch.nn.Parameter):
-        inp = inp.data
-    flat_shape = (inp.shape[0], np.prod(inp.shape[1:]))
-    a = torch.rand(flat_shape)
-    u, _, v = torch.linalg.svd(a, full_matrices=False)
-    inp.copy_((u if u.shape == flat_shape else v).reshape(inp.shape).mul(gain).to(device=inp.device, dtype=inp.dtype))
-    if isinstance(original_input, list):
-        return torch.nn.Parameter(inp)
-    return original_input
+LinformerSettings = namedtuple('LinformerSettings', ['k'])
+LinformerContextSettings = namedtuple('LinformerContextSettings', ['seq_len', 'k'])
 
+# helper functions
 
-class TripleNorm(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, scale0: torch.Tensor, scale1: torch.Tensor, shift: torch.Tensor, norm_power: int):
-        scale0_relu = scale0.relu()
-        inp = scale0_relu.pow(3) * scale1 + shift
-        inp = inp - inp.mean(1, True)
-        rstd = inp.size(1) ** (1 / norm_power) / inp.norm(norm_power, 1, True)
-        inp *= rstd
-        if scale1.requires_grad:
-            ctx.save_for_backward(scale0_relu, scale1, inp, rstd)
-        return inp
+def exists(val):
+    return val is not None
 
-    @staticmethod
-    def backward(ctx, dout: torch.Tensor):
-        if not ctx.saved_tensors:
-            return None, None, None, None
-        scale0_relu, scale1, out, rstd = ctx.saved_tensors
-        dout = dout * rstd
-        dout -= (dout * out).mean(1, True) * out
-        dout -= dout.mean(1, True)
-        d_scale = dout * scale0_relu.square()
-        return d_scale * scale1 * 3, d_scale * scale0_relu, dout, None
+def default(value, d):
+    return d if not exists(value) else value
 
+def always(value):
+    return lambda *args, **kwargs: value
 
-def conv(inp: torch.Tensor, weight: torch.Tensor, groups: int, use_pad: bool) -> torch.Tensor:
-    if use_pad and weight.size()[-1] - 1 > 0:
-        inp = F.pad(inp, (weight.size()[-1] - 1, 0))
-    return F.conv1d(inp, weight, groups=groups)
+def cast_tuple(val):
+    return (val,) if not isinstance(val, tuple) else val
+        
+def safe_div(n, d, eps = 1e-6):
+    return n.div_(d + eps)
 
+def lcm(*numbers):
+    return int(reduce(lambda x, y: int((x * y) / gcd(x, y)), numbers, 1))
 
-def expert_matmul(inp: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return torch.einsum("bgf,gfo->bgo", inp, weight)
+def merge_dims(ind_from, ind_to, tensor):
+    shape = list(tensor.shape)
+    arr_slice = slice(ind_from, ind_to + 1)
+    shape[arr_slice] = [reduce(mul, shape[arr_slice])]
+    return tensor.reshape(*shape)
 
+def expand_dim(t, dim, k, unsqueeze=True):
+    if unsqueeze:
+        t = t.unsqueeze(dim)
+    expand_shape = [-1] * len(t.shape)
+    expand_shape[dim] = k
+    return t.expand(*expand_shape)
 
-class AuxLoss(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, inp: torch.Tensor):
-        ctx.save_for_backward(inp)
-        return inp
+def split_at_index(dim, index, t):
+    pre_slices = (slice(None),) * dim
+    l = (*pre_slices, slice(None, index))
+    r = (*pre_slices, slice(index, None))
+    return t[l], t[r]
 
-    @staticmethod
-    def backward(ctx, grad_outputs: torch.Tensor):
-        inp, = ctx.saved_tensors
-        inp.mean().backward()
+def max_neg_value(tensor):
+    return -torch.finfo(tensor.dtype).max
 
+# helper classes
 
-def moe(inp: torch.Tensor, expert_weights: torch.nn.ParameterList, training: bool,
-        jitter_epsilon: float, feature_shuffle: torch.Tensor, groups: int, experts: int) -> torch.Tensor:
-    *expert_weights, gate = expert_weights
-    batch, features, sequence = inp.size()
-    tokens = batch * sequence
-    capacity = tokens // experts
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.fn = fn
+        self.norm = nn.LayerNorm(dim)
+    def forward(self, x, **kwargs):
+        x = self.norm(x)
+        return self.fn(x, **kwargs)
 
-    # get gates
-    if gate.dtype != torch.float32:
-        gate = gate.float()
-    inp = inp.transpose(1, 2).reshape(tokens, features)
-    input_fp32 = inp.float()
-    if training:
-        input_fp32 = input_fp32 * (torch.rand_like(input_fp32) * jitter_epsilon + 1)
-    logits = input_fp32.mm(gate)
-    gates = F.softmax(logits, dim=1)
+class Chunk(nn.Module):
+    def __init__(self, chunks, fn, along_dim = -1):
+        super().__init__()
+        self.dim = along_dim
+        self.chunks = chunks
+        self.fn = fn
 
-    # calculate permutation
-    with torch.no_grad():
-        mask = torch.ones_like(gates[:, 0])
+    def forward(self, x, **kwargs):
+        if self.chunks == 1:
+            return self.fn(x, **kwargs)
+        chunks = x.chunk(self.chunks, dim = self.dim)
+        return torch.cat([self.fn(c, **kwargs) for c in chunks], dim = self.dim)
+
+class ProjectInOut(nn.Module):
+    def __init__(self, fn, dim_in, dim_out, project_out = True):
+        super().__init__()
+        self.fn = fn
+        self.project_in = nn.Linear(dim_in, dim_out)
+        self.project_out = nn.Linear(dim_out, dim_in) if project_out else nn.Identity()
+
+    def forward(self, x, **kwargs):
+        x = self.project_in(x)
+        x = self.fn(x, **kwargs)
+        x = self.project_out(x)
+        return x
+
+# token shifting helper classes
+
+def shift(t, amount, mask = None):
+    if amount == 0:
+        return t
+
+    if exists(mask):
+        t = t.masked_fill(~mask[..., None], 0.)
+
+    return F.pad(t, (0, 0, amount, -amount), value = 0.)
+
+class PreShiftTokens(nn.Module):
+    def __init__(self, shifts, fn):
+        super().__init__()
+        self.fn = fn
+        self.shifts = tuple(shifts)
+
+    def forward(self, x, **kwargs):
+        mask = kwargs.get('mask', None)
+        shifts = self.shifts
+        segments = len(shifts)
+        feats_per_shift = x.shape[-1] // segments
+        splitted = x.split(feats_per_shift, dim = -1)
+        segments_to_shift, rest = splitted[:segments], splitted[segments:]
+        segments_to_shift = list(map(lambda args: shift(*args, mask = mask), zip(segments_to_shift, shifts)))
+        x = torch.cat((*segments_to_shift, *rest), dim = -1)
+        return self.fn(x, **kwargs)
+
+# positional embeddings
+
+class AbsolutePositionalEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len):
+        super().__init__()
+        self.emb = nn.Embedding(max_seq_len, dim)
+
+    def forward(self, x):
+        t = torch.arange(x.shape[1], device=x.device)
+        return self.emb(t)[None, :, :]
+
+# sinusoidal positional embeddings
+
+class FixedPositionalEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len):
+        super().__init__()
+        inv_freq = 1. / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        position = torch.arange(0, max_seq_len, dtype=torch.float)
+        sinusoid_inp = torch.einsum("i,j->ij", position, inv_freq)
+        emb = torch.cat((sinusoid_inp.sin(), sinusoid_inp.cos()), dim=-1)
+        self.register_buffer('emb', emb)
+
+    def forward(self, x):
+        return self.emb[None, :x.shape[1], :].to(x)
+
+# rotary positional embedding helpers
+
+def rotate_every_two(x):
+    x = rearrange(x, '... (d j) -> ... d j', j = 2)
+    x1, x2 = x.unbind(dim = -1)
+    x = torch.stack((-x2, x1), dim = -1)
+    return rearrange(x, '... d j -> ... (d j)')
+
+def apply_rotory_pos_emb(q, k, sinu_pos):
+    sinu_pos = rearrange(sinu_pos, '() n (j d) -> n j d', j = 2)
+    sin, cos = sinu_pos.unbind(dim = -2)
+    sin, cos = map(lambda t: repeat(t, 'b n -> b (n j)', j = 2), (sin, cos))
+    q, k = map(lambda t: (t * cos) + (rotate_every_two(t) * sin), (q, k))
+    return q, k
+
+# ---------- HELPERS -----------
+
+# ---------- MODULES -----------
+
+# feedforward
+
+class GELU_(nn.Module):
+    def forward(self, x):
+        return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
+
+GELU = nn.GELU if hasattr(nn, 'GELU') else GELU_
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, mult = 4, dropout = 0., activation = None, glu = False):
+        super().__init__()
+        activation = default(activation, GELU)
+
+        self.glu = glu
+        self.w1 = nn.Linear(dim, dim * mult * (2 if glu else 1))
+        self.act = activation()
+        self.dropout = nn.Dropout(dropout)
+        self.w2 = nn.Linear(dim * mult, dim)
+
+    def forward(self, x, **kwargs):
+        if not self.glu:
+            x = self.w1(x)
+            x = self.act(x)
+        else:
+            x, v = self.w1(x).chunk(2, dim=-1)
+            x = self.act(x) * v
+
+        x = self.dropout(x)
+        x = self.w2(x)
+        return x
+
+# self attention layer
+
+def linear_attn(q, k, v, kv_mask = None):
+    dim = q.shape[-1]
+
+    if exists(kv_mask):
+        mask_value = max_neg_value(q)
+        mask = kv_mask[:, None, :, None]
+        k = k.masked_fill_(~mask, mask_value)
+        v = v.masked_fill_(~mask, 0.)
+        del mask
+
+    q = q.softmax(dim=-1)
+    k = k.softmax(dim=-2)
+
+    q = q * dim ** -0.5
+
+    context = einsum('bhnd,bhne->bhde', k, v)
+    attn = einsum('bhnd,bhde->bhne', q, context)
+    return attn.reshape(*q.shape)
+
+def causal_linear_attn(q, k, v, kv_mask = None, bucket_size = None, eps = 1e-3):
+    b, h, n, e, dtype = *q.shape, q.dtype
+    bucket_size = default(bucket_size, 64)
+    bucket_size = max(bucket_size, 1)
+    assert bucket_size == 0 or (n % bucket_size) == 0, f'sequence length {n} must be divisible by the bucket size {bucket_size} for causal linear attention'
+
+    q = q.softmax(dim=-1)
+    k = torch.exp(k).type(dtype).clone()
+
+    q = q * e ** -0.5
+
+    if exists(kv_mask):
+        mask = kv_mask[:, None, :, None]
+        k = k.masked_fill_(~mask, 0.)
+        v = v.masked_fill_(~mask, 0.)
+        del mask
+
+    bucket_fn = lambda x: x.reshape(*x.shape[:-2], -1, bucket_size, e)
+    b_q, b_k, b_v = map(bucket_fn, (q, k, v))
+
+    b_k_sum = b_k.sum(dim=-2)
+    b_k_cumsum = b_k_sum.cumsum(dim = -2).type(dtype)
+
+    context = einsum('bhund,bhune->bhude', b_k, b_v)
+    context = context.cumsum(dim = -3).type(dtype)
+
+    if bucket_size > 1:
+        context = F.pad(context, (0, 0, 0, 0, 1, 0), value = 0.)
+        context, _ = split_at_index(2, -1, context)
+
+        b_k_cumsum = F.pad(b_k_cumsum, (0, 0, 1, 0), value = 0.)
+        b_k_cumsum, _ = split_at_index(2, -1, b_k_cumsum)
+
+    D_inv = 1. / einsum('bhud,bhund->bhun', b_k_cumsum, b_q).clamp(min = eps)
+    attn = einsum('bhund,bhude,bhun->bhune', b_q, context, D_inv)
+    return attn.reshape(*q.shape)
+
+class SelfAttention(nn.Module):
+    def __init__(self, dim, heads, causal = False, dim_head = None, blindspot_size = 1, n_local_attn_heads = 0, local_attn_window_size = 128, receives_context = False, dropout = 0., attn_dropout = 0.):
+        super().__init__()
+        assert dim_head or (dim % heads) == 0, 'embedding dimension must be divisible by number of heads'
+        d_heads = default(dim_head, dim // heads)
+
+        self.heads = heads
+        self.d_heads = d_heads
+        self.receives_context = receives_context
+
+        self.global_attn_heads = heads - n_local_attn_heads
+        self.global_attn_fn = linear_attn if not causal else partial(causal_linear_attn, bucket_size = blindspot_size)
+
+        self.local_attn_heads = n_local_attn_heads
+        self.local_attn  = LocalAttention(local_attn_window_size, causal = causal, dropout = attn_dropout)
+
+        self.to_q = nn.Linear(dim, d_heads * heads, bias = False)
+
+        kv_heads = heads
+
+        self.kv_heads = kv_heads
+        self.to_k = nn.Linear(dim, d_heads * kv_heads, bias = False)
+        self.to_v = nn.Linear(dim, d_heads * kv_heads, bias = False)
+
+        self.to_out = nn.Linear(d_heads * heads, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, input_mask = None, context = None, context_mask = None, pos_emb = None, **kwargs):
+        assert not (self.receives_context and not exists(context)), 'context must be supplied if self attention is in receives context mode'
+
+        if not self.receives_context:
+            q, k, v = (self.to_q(x), self.to_k(x), self.to_v(x))
+        else:
+            q, k, v = (self.to_q(x), self.to_k(context), self.to_v(context))
+
+        b, t, e, h, dh = *q.shape, self.heads, self.d_heads
+
+        merge_heads = lambda x: x.reshape(*x.shape[:2], -1, dh).transpose(1, 2)
+
+        q, k, v = map(merge_heads, (q, k, v))
+
+        if exists(pos_emb) and not self.receives_context:
+            q, k = apply_rotory_pos_emb(q, k, pos_emb)
+
         out = []
-        for g in gates.unbind(1):
-            _, idx = torch.topk(g * mask, capacity, 0)
-            out.append(idx)
-            mask[idx] = 0
-        expert_permutation = torch.stack(out, 1)
-        expert_permutation = expert_permutation.view(-1, 1).long()
-        permutation_inverse = torch.argsort(expert_permutation, 0).view(-1, 1)
-        expert_index = permutation_inverse // capacity
 
-    # apply loss
-    AuxLoss(gates.sum() / tokens)
-    inp = inp * gates.gather(1, expert_index)
+        split_index_fn = partial(split_at_index, 1, self.local_attn_heads)
 
-    # permute
-    inp = inp.gather(0, expert_permutation.expand_as(inp))
+        (lq, q), (lk, k), (lv, v) = map(split_index_fn, (q, k, v))
 
-    if feature_shuffle is not None:
-        inp = inp.gather(1, feature_shuffle.view(1, -1).expand_as(inp))
-    inp = inp.view(tokens // experts, experts * groups, features // groups)
-    if len(expert_weights) == 1:
-        inp = expert_matmul(inp, expert_weights[0])
-    else:
-        inp = torch.cat([expert_matmul(c, w) for c, w in zip(inp.chunk(len(expert_weights), 1), expert_weights)], -1)
-    inp = inp.reshape(tokens, -1)
-    inp = inp.gather(0, permutation_inverse.view(-1, 1).expand_as(inp))
-    inp = inp.view(batch, sequence, -1).transpose(1, 2)
-    return inp
+        has_local, has_global = map(lambda x: x.shape[1] > 0, (lq, q))
 
+        if has_local:
+            local_out = self.local_attn(lq, lk, lv, input_mask = input_mask)
+            out.append(local_out)
 
-def moe_check(inp: torch.Tensor, w: torch.nn.ParameterList, training: bool,
-              jitter_epsilon: float, feature_shuffle: torch.Tensor, groups: int, experts: int) -> torch.Tensor:
-    if experts > 0:
-        return moe(inp, w, training, jitter_epsilon, feature_shuffle, groups, experts)
-    return conv(inp, w[0], groups, False)
+        if has_global:
+            kv_mask = input_mask if not self.receives_context else context_mask
+            global_out = self.global_attn_fn(q, k, v, kv_mask = kv_mask)
+            out.append(global_out)
 
+        attn = torch.cat(out, dim=1)
+        attn = attn.transpose(1, 2).reshape(b, t, -1)
+        return self.dropout(self.to_out(attn))
 
-def linear_attention(inp: torch.Tensor, divisor: torch.Tensor,
-                     w0: torch.nn.ParameterList,
-                     feature_shuffle0: typing.Optional[torch.Tensor], groups0: int, experts0: int,
-                     w1: torch.Tensor,
-                     w2: torch.nn.ParameterList,
-                     feature_shuffle2: typing.Optional[torch.Tensor], groups2: int, experts2: int,
-                     input_cache: torch.Tensor, cumsum_cache: torch.Tensor, bottleneck_group: int, training: bool,
-                     caching: bool, idx: int, norm_power: int, jitter_epsilon: float
-                     ) -> typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    kernel_size = w1.size(2)
-    pad = True
-    if not training and caching:
-        if idx - 1 > kernel_size and inp.size(2) == 1:
-            pad = False
-            inp = torch.cat([input_cache, inp], -1)
-        input_cache = inp[:, :, -kernel_size + 1:].detach()
-    inp = moe_check(inp, w0, training, jitter_epsilon, feature_shuffle0, groups0, experts0)
-    depth, scale, shift = inp.chunk(3, 1)
-    cum = depth.cumsum(-1)
-    if not training and caching:
-        cum = cum + cumsum_cache
-        scale = scale[:, :, -1:]
-        shift = shift[:, :, -1:]
-        cum = cum[:, :, -1:]
-        if idx - 1 > kernel_size:
-            cumsum_cache = cum.detach()
-    inp = TripleNorm.apply(cum / divisor, scale, shift, norm_power)
-    inp = conv(inp, w1, bottleneck_group, pad)
-    inp = TripleNorm.apply(*inp.chunk(3, 1), norm_power)
-    inp = moe_check(inp, w2, training, jitter_epsilon, feature_shuffle2, groups2, experts2)
-    return input_cache, cumsum_cache, inp
+# transformer and language model classes
+
+class FoldAxially(nn.Module):
+    def __init__(self, axial_dim, fn):
+        super().__init__()
+        self.fn = fn
+        self.axial_dim = axial_dim
+    def forward(self, x, input_mask = None, **kwargs):
+        b, t, d, ax = *x.shape, self.axial_dim
+        x = x.reshape(b, -1, ax, d).transpose(1, 2).reshape(b * ax, -1, d)
+
+        mask = None
+        if exists(input_mask):
+            mask = input_mask.reshape(b, -1, ax).transpose(1, 2).reshape(b * ax, -1)
+
+        x = self.fn(x, input_mask = mask, **kwargs)
+        x = x.reshape(b, ax, -1, d).transpose(1, 2).reshape(b, t, d)
+        return x
 
 
-def conv_weight(in_features: int, out_features: int, kernel_size: int, groups: int, std: float):
-    return orthonormal(torch.nn.Conv1d(in_features, out_features, (kernel_size,), groups=groups).weight, 1 / std)
 
+class LinearAttentionTransformer(nn.Module):
+    def __init__(
+        self,
+        dim,
+        depth,
+        max_seq_len,
+        heads = 8,
+        dim_head = None,
+        bucket_size = 64,
+        causal = False,
+        ff_chunks = 1,
+        ff_glu = False,
+        ff_dropout = 0.,
+        attn_layer_dropout = 0.,
+        attn_dropout = 0.,
+        reversible = False,
+        blindspot_size = 1,
+        n_local_attn_heads = 0,
+        local_attn_window_size = 128,
+        receives_context = False,
+        attend_axially = False,
+        pkm_layers = tuple(),
+        pkm_num_keys = 128,
+        linformer_settings = None,
+        context_linformer_settings = None,
+        shift_tokens = False
+    ):
+        super().__init__()
+        assert not (causal and exists(linformer_settings)), 'Linformer self attention layer can only be used for non-causal networks'
+        assert not exists(linformer_settings) or isinstance(linformer_settings, LinformerSettings), 'Linformer self-attention settings must be a LinformerSettings namedtuple'
+        assert not exists(context_linformer_settings) or isinstance(context_linformer_settings, LinformerContextSettings), 'Linformer contextual self-attention settings must be a LinformerSettings namedtuple'
 
-class Trainer(torch.nn.Module):
-    def __init__(self, ctx: Context, model: torch.nn.Module, data: typing.Optional[torch.Tensor]):
-        super(Trainer, self).__init__()
-        self.ctx = ctx
-        self.model = torch.jit.trace(model, data) if data else model
-        self.optimizer = build_optimizer(ctx, self.model.parameters())
-        self.scheduler = lr_schedules.OneCycle(self.optimizer,
-                                               ctx.optimizer.one_cycle.cycle_min_lr,
-                                               ctx.optimizer.one_cycle.cycle_max_lr,
-                                               ctx.optimizer.one_cycle.decay_lr_rate,
-                                               ctx.optimizer.one_cycle.cycle_first_step_size,
-                                               ctx.optimizer.one_cycle.cycle_second_step_size,
-                                               ctx.optimizer.one_cycle.cycle_first_stair_count,
-                                               ctx.optimizer.one_cycle.cycle_second_stair_count,
-                                               ctx.optimizer.one_cycle.decay_step_size,
-                                               ctx.optimizer.one_cycle.cycle_momentum,
-                                               ctx.optimizer.one_cycle.cycle_min_mom,
-                                               ctx.optimizer.one_cycle.cycle_max_mom,
-                                               ctx.optimizer.one_cycle.decay_mom_rate,
-                                               ctx.optimizer.one_cycle.last_batch_iteration)
+        if type(n_local_attn_heads) is not tuple:
+            n_local_attn_heads = tuple([n_local_attn_heads] * depth)
 
-    @torch.no_grad()
-    def _to_device_detach(self, inp: torch.Tensor) -> torch.Tensor:
-        return inp.to(device=self.ctx.model.device, non_blocking=True).detach()
+        assert len(n_local_attn_heads) == depth, 'local attention heads tuple must have the same length as the depth'
+        assert all([(local_heads <= heads) for local_heads in n_local_attn_heads]), 'number of local attn heads must be less than the maximum number of heads'
 
-    def _forward_backward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
-        x_batch = self._to_device_detach(src)
-        output = self.model(x_batch)
-        loss = F.cross_entropy(output, self._to_device_detach(tgt))
-        loss.backward()
-        return loss.detach()
+        layers = nn.ModuleList([])
 
-    @torch.no_grad()
-    def _clip_gradient(self):
-        for p in self.gradients():
-            g_norm = p.grad.norm(2, 0, True).clamp(min=self.ctx.optimizer.agc.zero_division_eps)
-            p_norm = p.norm(2, 0, True).clamp(min=self.ctx.optimizer.agc.eps)
-            grad_scale = (p_norm / g_norm * self.ctx.optimizer.agc.gradient_clipping).clamp(max=1)
-            p.grad.data.copy_(p.grad * grad_scale)
+        for ind, local_heads in zip(range(depth), n_local_attn_heads):
+            layer_num = ind + 1
+            use_pkm = layer_num in cast_tuple(pkm_layers)
 
-    def accumulated_step(self, data: torch.Tensor) -> torch.Tensor:
-        loss = sum(self._forward_backward(s, t) for s, t in zip(*data))
-        self._clip_gradient()
-        return loss
+            parallel_net = Chunk(ff_chunks, FeedForward(dim), along_dim = 1) if not use_pkm else PKM(dim)
 
-    @torch.no_grad()
-    def zero_grad(self):
-        for p in self.model.parameters():
-            p.grad = None
+            if not exists(linformer_settings):
+                attn = SelfAttention(dim, heads, causal, dim_head = dim_head, blindspot_size = blindspot_size, n_local_attn_heads = local_heads, local_attn_window_size = local_attn_window_size, dropout = attn_layer_dropout, attn_dropout= attn_dropout)
+            else:
+                attn = LinformerSelfAttention(dim, max_seq_len, heads = heads, dim_head = dim_head, dropout = attn_dropout, **linformer_settings._asdict())
 
-    @torch.no_grad()
-    def gradients(self) -> torch.nn.Parameter:
-        for p in self.model.parameters():
-            if p.grad is None:
-                continue
-            yield p
+            if shift_tokens:
+                shifts = (1, 0, -1) if not causal else (1, 0)
+                attn, parallel_net = map(partial(PreShiftTokens, shifts), (attn, parallel_net))
 
-    def save(self):
-        torch.save(self.state_dict(), self.ctx.model.checkpoint_path)
+            layers.append(nn.ModuleList([
+                PreNorm(dim, attn),
+                PreNorm(dim, parallel_net)
+            ]))
 
-    def load(self):
-        wrong_keys = self.load_state_dict(torch.load(self.ctx.model.checkpoint_path), strict=False)
-        for key in wrong_keys.missing_keys + wrong_keys.unexpected_keys:
-            if not any(k.startswith('_') for k in key.split('.')):
-                if key in wrong_keys.missing_keys:
-                    raise ValueError(f"{key} is missing in checkpoint but exists in model")
-                if key in wrong_keys.unexpected_keys:
-                    raise ValueError(f"{key} is missing in model but exists in checkpoint")
+            if attend_axially:
+                layers.append(nn.ModuleList([
+                    PreNorm(dim, FoldAxially(local_attn_window_size, SelfAttention(dim, heads, causal, dropout = attn_layer_dropout, attn_dropout= attn_dropout))),
+                    PreNorm(dim, Chunk(ff_chunks, FeedForward(dim, glu = ff_glu, dropout= ff_dropout), along_dim = 1))
+                ]))
 
+            if receives_context:
+                if not exists(context_linformer_settings):
+                    attn = SelfAttention(dim, heads, dim_head = dim_head, dropout = attn_layer_dropout, attn_dropout= attn_dropout, receives_context = True)
+                else:
+                    attn = LinformerSelfAttention(dim, heads = heads, dim_head = dim_head, dropout = attn_dropout, **context_linformer_settings._asdict())
 
-class LinearAttention(torch.nn.Module):
+                layers.append(nn.ModuleList([
+                    PreNorm(dim, attn),
+                    PreNorm(dim, Chunk(ff_chunks, FeedForward(dim, glu = ff_glu, dropout= ff_dropout), along_dim = 1))
+                ]))
+
+        execute_type = ReversibleSequence if reversible else SequentialSequence
+
+        axial_layer = ((True, False),) if attend_axially else tuple()
+        attn_context_layer = ((True, False),) if receives_context else tuple()
+        route_attn = ((True, False), *axial_layer, *attn_context_layer) * depth
+        route_context = ((False, False), *axial_layer, *attn_context_layer) * depth
+
+        context_route_map = {'context': route_context, 'context_mask': route_context} if receives_context else {}
+        attn_route_map = {'input_mask': route_attn, 'pos_emb': route_attn}
+        self.layers = execute_type(layers, args_route = {**attn_route_map, **context_route_map})
+
+        self.pad_to_multiple = lcm(
+            1 if not causal else blindspot_size,
+            1 if all([(h == 0) for h in n_local_attn_heads]) else local_attn_window_size
+        )
+
+    def forward(self, x, **kwargs):
+        return self.layers(x, **kwargs)
+
+# ------------ MODULES ----------------
+
+class LinearAttentionLM(torch.nn.Module):
     def __init__(self, ctx: Context):
-        super(LinearAttention, self).__init__()
-        self.embedding = torch.nn.Embedding(ctx.dataset.classes, ctx.model.features * 2).to(ctx.model.device)
-        orthonormal(self.embedding.weight, ctx.model.input_embedding_std * 2 ** -0.5)
+        model_ctx = ctx.model
 
-        pos_embd = torch.arange(0, ctx.model.sequence_length).unsqueeze(0) + 1
-        self.register_buffer("divisor", pos_embd.unsqueeze(0).to(torch.float).to(ctx.model.device))
-
-        cell = LinearAttentionCell(self, ctx, 1)
-        self.stem = revlib.utils.momentum_net([copy.deepcopy(cell) for _ in range(ctx.model.depth)],
-                                              target_device=ctx.model.device)
-        self.output = torch.nn.Conv1d(ctx.model.features * 2, ctx.dataset.classes, (1,)).to(ctx.model.device)
-        torch.nn.init.zeros_(self.output.weight.data)
-
-    def forward(self, inp: torch.Tensor):
-        x = self.embedding(inp).transpose(1, 2)
-        return self.output(x)
-
-    def reset_cache(self):
-        for mod in self.stem.modules():
-            if isinstance(mod, LinearAttentionCell):
-                mod.reset_cache()
+        n_local_attn_heads = model_ctx.n_local_attn_heads
+        max_seq_len = model_ctx.max_seq_len
+        local_attn_window_size = model_ctx.local_attn_window_size
+        dim = model_ctx.dim
+        num_tokens = model_ctx.num_tokens
+        use_rotary_emb = model_ctx.use_rotary_emb
+        dim_head = model_ctx.dim_head
+        use_axial_pos_emb = model_ctx.use_axial_pos_emb
+        depth = model_ctx.depth
+        heads = model_ctx.heads
+        causal = model_ctx.causal
 
 
-class ParameterStore(torch.nn.Module):
-    """
-    Something (likely deepspeed) changes all parameters in a ParameterList to [1] even though standalone parameters
-    work. That's why a torch.nn.ModuleList of ParameterStores needs to be initialized.
-    """
-
-    def __init__(self, param: torch.Tensor):
-        super(ParameterStore, self).__init__()
-        self.param = torch.nn.Parameter(param)
-
-    def __repr__(self):
-        return (f'{self.__class__.__name__}(shape={str(list(self.param.size()))}, device={self.param.device}, '
-                f'dtype={self.param.dtype})')
 
 
-def get_moe_param(in_features: int, out_features: int, groups: int, experts: int, expert_chunks: int, std: float
-                  ) -> typing.List[torch.nn.Parameter]:
-    if experts:
-        experts = groups if experts < 0 else experts
-        out = orthonormal([in_features // groups, out_features // groups], std).view(1, in_features // groups, -1)
-        out = out.repeat(experts // expert_chunks * groups, 1, 1).detach()
-        gate = [orthonormal([in_features, experts], 1)]
-        return [torch.nn.Parameter(copy.deepcopy(out)) for _ in range(expert_chunks)] + gate
-    return [torch.nn.Parameter(conv_weight(in_features, out_features, 1, groups, std))]
+        assert n_local_attn_heads == 0 or (max_seq_len % local_attn_window_size) == 0, 'max sequence length must be divisible by the local attention window size'
+        super().__init__()
+        emb_dim = default(emb_dim, dim)
+        self.max_seq_len = max_seq_len
 
+        self.token_emb = nn.Embedding(num_tokens, emb_dim)
 
-class LinearAttentionCell(torch.nn.Module):
-    def __init__(self, base: LinearAttention, ctx: Context, init_scale: float):
-        super(LinearAttentionCell, self).__init__()
-        self.divisor = lambda: base.divisor
-        self.init_scale = init_scale
-        self.caching = ctx.eval.cache
-        self.kernel_size = ctx.model.conv_kernel_size
-        self.bottleneck_group = ctx.model.bottleneck_group
-        self.norm_power = ctx.model.norm_power
-        self.groups0 = ctx.model.input_groups
-        self.groups2 = ctx.model.output_groups
-        self.experts0 = ctx.model.experts_in_input
-        self.experts2 = ctx.model.experts_in_output
-        self.jitter_epsilon = ctx.model.moe_jitter_epsilon
-        self.expert_chunks = ctx.model.expert_chunks
-        intermediate = int(ctx.model.features * ctx.model.feed_forward_intermediate_factor)
-        self.w0 = torch.nn.ParameterList(get_moe_param(ctx.model.features, intermediate * 3, self.groups0,
-                                                       self.experts0, self.expert_chunks, ctx.model.activation_std))
-        self.w1 = conv_weight(intermediate, intermediate * 3, ctx.model.conv_kernel_size, ctx.model.bottleneck_group,
-                              ctx.model.activation_std)
-        self.w2 = torch.nn.ParameterList(get_moe_param(intermediate, ctx.model.features, self.groups2,
-                                                       self.experts2, self.expert_chunks, 1))
-        self.idx: int = 0
-        self._input_cache = torch.zeros([])
-        self._cumsum_cache = torch.zeros([])
-        if ctx.model.feature_shuffle:
-            self.register_buffer("feature_shuffle0", torch.argsort(torch.randn(ctx.model.features)).view(1, -1, 1))
-            self.register_buffer("feature_shuffle2", torch.argsort(torch.randn(intermediate)).view(1, -1, 1))
+        if use_rotary_emb:
+            self.pos_emb = FixedPositionalEmbedding(emb_dim, max_seq_len)
+            self.layer_pos_emb = FixedPositionalEmbedding(dim_head, max_seq_len)
+        elif use_axial_pos_emb:
+            self.pos_emb = AxialPositionalEmbedding(emb_dim, axial_shape=(math.ceil(max_seq_len / local_attn_window_size), local_attn_window_size))
+            self.layer_pos_emb = always(None)
         else:
-            self.feature_shuffle0 = None
-            self.feature_shuffle2 = None
+            self.pos_emb = AbsolutePositionalEmbedding(emb_dim, max_seq_len)
+            self.layer_pos_emb = always(None)
 
-    def reset_cache(self):
-        self._cumsum_cache = torch.zeros([])
-        self._input_cache = torch.zeros([])
-        self.idx = 0
+        self.transformer = LinearAttentionTransformer(dim, depth, max_seq_len, heads = heads, dim_head = dim_head, causal = causal, ff_chunks = model_ctx.ff_chunks, ff_glu = model_ctx.ff_glu, ff_dropout = model_ctx.ff_dropout, attn_layer_dropout = model_ctx.attn_layer_dropout, attn_dropout = model_ctx.attn_dropout, reversible = model_ctx.reversible, blindspot_size = model_ctx.blindspot_size, n_local_attn_heads = n_local_attn_heads, local_attn_window_size = local_attn_window_size, receives_context = model_ctx.receives_context, pkm_layers = model_ctx.pkm_layers, pkm_num_keys = model_ctx.pkm_num_keys, attend_axially = model_ctx.attend_axially, linformer_settings = model_ctx.linformer_settings, context_linformer_settings = model_ctx.context_linformer_settings, shift_tokens = model_ctx.shift_tokens)
 
-    def forward(self, inp: torch.Tensor) -> torch.Tensor:
-        if self.training:
-            div = self.divisor()
-        elif self.caching:
-            self.idx += inp.size(2)
-            div = torch.LongTensor([self.idx]).to(inp.device)
-        else:
-            self.idx = inp.size(2)
-            div = torch.arange(self.idx, device=inp.device).view(1, 1, -1) + 1
-        self._input_cache, self._cumsum_cache, out = linear_attention(inp, div,
-                                                                      self.w0, self.feature_shuffle0, self.groups0,
-                                                                      self.experts0,
-                                                                      self.w1,
-                                                                      self.w2, self.feature_shuffle2, self.groups2,
-                                                                      self.experts2, self._input_cache,
-                                                                      self._cumsum_cache, self.bottleneck_group,
-                                                                      self.training, self.caching, self.idx,
-                                                                      self.norm_power, self.jitter_epsilon
-                                                                      )
-        out = out * self.init_scale
-        return 
+        if emb_dim != dim:
+            self.transformer = ProjectInOut(self.transformer, emb_dim, dim, project_out = not model_ctx.return_embeddings)
+
+        self.norm = nn.LayerNorm(emb_dim)
+        self.out = nn.Linear(emb_dim, num_tokens) if not model_ctx.return_embeddings else nn.Identity()
+
+    def forward(self, x, **kwargs):
+        x = self.token_emb(x)
+        x = x + self.pos_emb(x).type(x.type())
+
+        layer_pos_emb = self.layer_pos_emb(x)
+        x = self.transformer(x, pos_emb = layer_pos_emb, **kwargs)
+        x = self.norm(x)
+        return self.out(x)

@@ -5,3 +5,8 @@ rich>=10.9.0
 numpy>=1.21.2
 deepspeed>=0.5.1
 revlib>=1.1.0
+axial-positional-embedding
+einops
+linformer>=0.1.0
+local-attention
+product-key-memory>=0.1.5

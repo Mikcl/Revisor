@@ -17,19 +17,32 @@ class Model(DataClass):
     device: str = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     offloading: bool = False
 
-    # PROBABLY WANT TO DELETE
-    conv_kernel_size: int = 7
-    feature_shuffle: bool = False
-    feed_forward_intermediate_factor: float = 2.
-    norm_power: int = 2  # 1 = mean(abs(x)), 2 = std, ...
-    bottleneck_group: int = 1  # not all group counts are possible. it has to be divide self.features without residual
-    offloading: bool = False
-    input_groups: int = 1
-    output_groups: int = 1
-    experts_in_input: int = 0  # 0 to disable MoE
-    experts_in_output: int = 0
-    moe_jitter_epsilon: float = 0.02
-    expert_chunks: int = 1  # Increase it if not all MoE parameters fit onto the GPU
-    activation_std: float = 0.5893595616022745  # std(relu(torch.randn((inf,)))) == 0.5893595616022745
+    num_tokens:int = 256 # Dataset.classes,     
+    dim:int = 256 # Embedding dimension = self.features.
+    depth:int = 1
+    max_seq_len: int = 256,
+    heads:int = 8
+    dim_head:int = 64
+    causal:bool = False
+    emb_dim:int = 256 # also embedding dimension
+    reversible:bool = False
+    ff_chunks:int = 1
+    ff_glu:bool = False
+    ff_dropout = 0.
+    attn_layer_dropout = 0.
+    attn_dropout = 0.
+    blindspot_size = 1
+    n_local_attn_heads = 0
+    local_attn_window_size = 128
+    return_embeddings = False
+    receives_context = False
+    pkm_layers = tuple()
+    pkm_num_keys = 128
+    attend_axially = False
+    linformer_settings = None
+    context_linformer_settings = None
+    use_axial_pos_emb = True
+    use_rotary_emb = False
+    shift_tokens = False
     input_embedding_std: float = 1.
     position_embedding_std: float = 1.

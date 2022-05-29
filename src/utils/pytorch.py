@@ -8,7 +8,8 @@ import random
 from ..data_class.context import Context
 from typing import Optional
 
-from ..model import LinearAttention, Trainer
+from ..model import LinearAttentionLM
+from ..trainer import Trainer
 from .formatting import pretty_print
 
 DataLoaderIter = torch.utils.data.dataloader._BaseDataLoaderIter
@@ -41,7 +42,7 @@ def setup_torch(seed: int):
 
 
 def get_model(ctx: Context, load_model: bool, data: Optional[torch.Tensor] = None) -> Trainer:
-    mod = Trainer(ctx, LinearAttention(ctx).to(dtype=torch.float16 if ctx.model.float16 else torch.float),
+    mod = Trainer(ctx, LinearAttentionLM(ctx).to(dtype=torch.float16 if ctx.model.float16 else torch.float),
                   data if data is None else None)
 
     if ctx.model.print_on_init:
