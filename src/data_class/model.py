@@ -19,11 +19,11 @@ class Model(DataClass):
 
     num_tokens:int = 256 # Dataset.classes,     
     dim:int = 32 # Embedding dimension = self.features.
-    depth:int = 1
+    depth:int = 3
     max_seq_len: int = 64
-    heads:int = 4
+    heads:int = 8
     dim_head:int = 32
-    causal:bool = False
+    causal:bool = True
     emb_dim:int = 16 # also embedding dimension
     reversible:bool = False
     ff_chunks:int = 1
