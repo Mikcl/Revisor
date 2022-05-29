@@ -20,7 +20,7 @@ class Model(DataClass):
     num_tokens:int = 256 # Dataset.classes,     
     dim:int = 256 # Embedding dimension = self.features.
     depth:int = 1
-    max_seq_len: int = 256,
+    max_seq_len: int = 256
     heads:int = 8
     dim_head:int = 64
     causal:bool = False
