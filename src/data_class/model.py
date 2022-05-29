@@ -18,13 +18,13 @@ class Model(DataClass):
     offloading: bool = False
 
     num_tokens:int = 256 # Dataset.classes,     
-    dim:int = 256 # Embedding dimension = self.features.
+    dim:int = 32 # Embedding dimension = self.features.
     depth:int = 1
     max_seq_len: int = 256
-    heads:int = 8
+    heads:int = 4
     dim_head:int = 64
     causal:bool = False
-    emb_dim:int = 256 # also embedding dimension
+    emb_dim:int = 32 # also embedding dimension
     reversible:bool = False
     ff_chunks:int = 1
     ff_glu:bool = False
