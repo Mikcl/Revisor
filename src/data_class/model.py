@@ -31,7 +31,7 @@ class Model(DataClass):
     ff_dropout = 0.
     attn_layer_dropout = 0.
     attn_dropout = 0.
-    blindspot_size = 1
+    blindspot_size = 64
     n_local_attn_heads = 0
     local_attn_window_size = 64
     return_embeddings = False
