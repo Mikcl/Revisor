@@ -466,6 +466,7 @@ class LinearAttentionLM(torch.nn.Module):
         depth = model_ctx.depth
         heads = model_ctx.heads
         causal = model_ctx.causal
+        emb_dim = model_ctx.emb_dim
 
 
 
