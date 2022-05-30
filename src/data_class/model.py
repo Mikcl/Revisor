@@ -19,7 +19,7 @@ class Model(DataClass):
 
     num_tokens:int = 256 # Dataset.classes,     
     dim:int = 32 # Embedding dimension = self.features.
-    depth:int = 3
+    depth:int = 1
     max_seq_len: int = 64
     heads:int = 8
     dim_head:int = 32
@@ -31,7 +31,7 @@ class Model(DataClass):
     ff_dropout = 0.
     attn_layer_dropout = 0.
     attn_dropout = 0.
-    blindspot_size = 64
+    blindspot_size = 1
     n_local_attn_heads = 0
     local_attn_window_size = 64
     return_embeddings = False
@@ -41,7 +41,7 @@ class Model(DataClass):
     attend_axially = False
     linformer_settings = None
     context_linformer_settings = None
-    use_axial_pos_emb = True
+    use_axial_pos_emb = False
     use_rotary_emb = False
     shift_tokens = False
     input_embedding_std: float = 1.

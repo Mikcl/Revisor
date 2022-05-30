@@ -2,6 +2,7 @@ import copy
 import typing
 
 import torch
+from torch.nn import functional as F
 
 from deepspeed.runtime import lr_schedules
 
