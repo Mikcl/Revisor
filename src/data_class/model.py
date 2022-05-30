@@ -11,18 +11,18 @@ class Model(DataClass):
     features: int = 256
     momentumnet_beta: float = 0.99  # The higher this is, the more numerically stable. BUT also lower impact per layer
     depth: int = 16
-    batch_size: int = 64
-    sequence_length: int = 64
+    batch_size: int = 32
+    sequence_length: int = 32
     float16: bool = False
     device: str = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     offloading: bool = False
 
     num_tokens:int = 256 # Dataset.classes,     
-    dim:int = 32 # Embedding dimension = self.features.
+    dim:int = 8 # Embedding dimension = self.features.
     depth:int = 1
-    max_seq_len: int = 64
+    max_seq_len: int = 32
     heads:int = 8
-    dim_head:int = 32
+    dim_head:int = 8
     causal:bool = True
     emb_dim:int = 16 # also embedding dimension
     reversible:bool = False
@@ -33,11 +33,11 @@ class Model(DataClass):
     attn_dropout = 0.
     blindspot_size = 1
     n_local_attn_heads = 0
-    local_attn_window_size = 64
+    local_attn_window_size = 32
     return_embeddings = False
     receives_context = False
     pkm_layers = tuple()
-    pkm_num_keys = 64
+    pkm_num_keys = 32
     attend_axially = False
     linformer_settings = None
     context_linformer_settings = None
