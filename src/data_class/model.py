@@ -20,7 +20,7 @@ class Model(DataClass):
     num_tokens:int = 256 # Dataset.classes,     
     dim:int = 8 # Embedding dimension = self.features.
     depth:int = 1
-    max_seq_len: int = 32
+    max_seq_len: int = 64
     heads:int = 8
     dim_head:int = 8
     causal:bool = True
@@ -33,7 +33,7 @@ class Model(DataClass):
     attn_dropout = 0.
     blindspot_size = 1
     n_local_attn_heads = 0
-    local_attn_window_size = 32
+    local_attn_window_size = 64
     return_embeddings = False
     receives_context = False
     pkm_layers = tuple()
