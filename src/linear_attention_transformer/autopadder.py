@@ -2,7 +2,7 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
-from ..model import LinearAttentionTransformer, LinearAttentionTransformerLM
+from ..model import LinearAttentionTransformer, LinearAttentionLM
 
 def find_module(nn_module, type):
     for module in nn_module.modules():
@@ -27,7 +27,7 @@ class Autopadder(nn.Module):
         super().__init__()
         self.net = net
 
-        is_lm = isinstance(net, LinearAttentionTransformerLM)
+        is_lm = isinstance(net, LinearAttentionLM)
         transformer = find_module(net, LinearAttentionTransformer)
         self.pad_to = transformer.pad_to_multiple
         self.pad_dim = -1 if is_lm else -2
