@@ -9,7 +9,7 @@ from ..data_class.context import Context
 from typing import Optional
 
 from ..model import LinearAttentionLM
-from ..linear_attention_transformer.reversible import AutoregressiveWrapper
+from ..linear_attention_transformer.autoregressive_wrapper import AutoregressiveWrapper
 from ..trainer import Trainer
 from .formatting import pretty_print
 
