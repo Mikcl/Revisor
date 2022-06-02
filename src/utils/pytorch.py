@@ -9,6 +9,7 @@ from ..data_class.context import Context
 from typing import Optional
 
 from ..model import LinearAttentionLM
+from ..linear_attention_transformer.reversible import AutoregressiveWrapper
 from ..trainer import Trainer
 from .formatting import pretty_print
 
@@ -42,7 +43,8 @@ def setup_torch(seed: int):
 
 
 def get_model(ctx: Context, load_model: bool, data: Optional[torch.Tensor] = None) -> Trainer:
-    mod = Trainer(ctx, LinearAttentionLM(ctx).to(dtype=torch.float16 if ctx.model.float16 else torch.float),
+    
+    mod = Trainer(ctx, AutoregressiveWrapper(LinearAttentionLM(ctx).to(dtype=torch.float16 if ctx.model.float16 else torch.float)),
                   data if data is None else None)
 
     if ctx.model.print_on_init:
