@@ -2,6 +2,7 @@ model:
   depth: 32
   batch_size: 1024
   features: 1024
+  causal: true
 optimizer:
   one_cycle:
     cycle_first_step_size: 8192
